@@ -288,6 +288,81 @@ ACCENT_BLURBEHIND = 3      # 只模糊,不着色
 ACCENT_ACRYLIC = 4         # 模糊 + 噪点,Win11 上就是"云母"那种质感
 WCA_ACCENT_POLICY = 19
 
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER = 0x1, 0x2, 0x4
+SWP_NOACTIVATE, SWP_FRAMECHANGED = 0x10, 0x20
+
+
+def top_hwnd(win):
+    """一扇窗真正的顶层句柄。
+
+    overrideredirect 的 Tk 窗外面还裹着一层系统框架:圆角、毛玻璃,以及"别进
+    任务栏"都得挂在那上面,挂到里面的子窗上就静默失效。
+    """
+    return ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+
+
+def mark_tool_window(win):
+    """把一扇窗从任务栏和 Alt+Tab 里摘出去。
+
+    overrideredirect 只是去掉标题栏。Tk 建这种窗的时候本来会顺手挂上
+    WS_EX_TOOLWINDOW(所以刚建好的一瞬间其实是不进任务栏的),可窗口样式是 Tk
+    在管着的,它重算的时候并不带上这个标记 —— 实测:一扇刚建好的无边框窗本来
+    是"工具窗",透明度一改(不透明 → 半透明),标记就没了,任务栏上随即多出
+    一个图标。所以这个标记得有人反复看着,见 set_alpha。
+
+    WS_EX_TOOLWINDOW 是 Windows 给"工具窗"这个身份的正规标记:带上它,任务栏
+    和 Alt+Tab 都不认。顺手把 WS_EX_APPWINDOW 抹掉 —— 那是反方向的标记,留着
+    的话两个位打架。
+
+    改完样式位还得 SetWindowPos 一次:外壳在窗口显示的那一刻就把它记进任务栏
+    了,不敲这一下,它不会回头重新认。已经对上的就直接返回,免得动画里每帧都
+    去折腾一次外壳。
+
+    Tk 的窗是两层:winfo_id() 拿到的里面那层(TkChild)其实是子窗,外壳认的是
+    它外面裹着的那层(TkTopLevel),那才是真正的顶层窗。两个都设一遍,什么时候
+    调都不至于落空。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.c_ssize_t]
+        user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+        user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_uint]
+
+        inner = win.winfo_id()
+        outer = user32.GetParent(inner)
+        for hwnd in ([outer, inner] if outer else [inner]):
+            ex = user32.GetWindowLongPtrW(ctypes.c_void_p(hwnd), GWL_EXSTYLE)
+            want = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            if want == ex:
+                continue           # 已经在位,别去惊动外壳
+            user32.SetWindowLongPtrW(ctypes.c_void_p(hwnd), GWL_EXSTYLE, want)
+            user32.SetWindowPos(ctypes.c_void_p(hwnd), None, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                                | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+    except Exception:
+        pass
+
+
+def set_alpha(win, value):
+    """给窗口设整窗透明度,顺便把"工具窗"这个身份补回来。
+
+    不直接用 win.attributes("-alpha", ...) 是有原因的:透明度一改,Tk 就会重算
+    一遍窗口样式,而它重算时只记得"置顶"和"分层"这两件事,把 Windows 给工具窗
+    的标记漏掉了 —— 于是窗口"啪"地又回到任务栏上。凡是会改透明度的窗口都走这
+    里,这个坑就不用每处记一遍。
+    """
+    win.attributes("-alpha", value)
+    mark_tool_window(win)
+
 
 def set_backdrop(hwnd, state, tint=None, tint_a=0.72):
     """给窗口挂上毛玻璃。返回是否成功(失败就老老实实用均匀透明)。
@@ -582,6 +657,67 @@ def humanize(td):
     if mi:
         return f"{mi} 分钟"
     return "不到 1 分钟"
+
+
+# 单位 → 分钟。长的排前面,匹配单位时先试长的("分钟" 要先于 "分")
+_SPAN_UNITS = (("个钟头", 60), ("小时", 60), ("钟头", 60), ("分钟", 1),
+               ("min", 1), ("天", 1440), ("日", 1440), ("时", 60),
+               ("h", 60), ("m", 1), ("分", 1))
+
+_CN_DIGIT = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+             "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_num(txt):
+    """「一」「二十」「十五」→ 阿拉伯数字;认不出来返回 None。"""
+    m = re.fullmatch(r"([一二两三四五六七八九])?十([一二三四五六七八九])?", txt)
+    if m:
+        return str((_CN_DIGIT.get(m.group(1), 1) * 10)
+                   + _CN_DIGIT.get(m.group(2), 0))
+    if txt in _CN_DIGIT:
+        return str(_CN_DIGIT[txt])
+    return None
+
+
+def parse_span_str(s):
+    """把「从现在起多久」解析成 timedelta;空串返回 None;看不懂抛 ValueError。
+
+    认这些:1小时 / 一小时 / 90分钟 / 1.5小时 / 1小时30分 / 2天 / 半小时 /
+    1 个半小时 / 1h30m / 45(光写数字按分钟算)。
+
+    为什么要有这个:只想"一小时后叫我"的人,不该被逼着先去算那是几点。
+    两种说法最后落到同一个 due 字段上,只是从哪头进来的区别。
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    s = s.replace("：", ":").replace("　", "").replace(" ", "").lower()
+    # 「一小时」「二十分钟」是中文里最顺口的说法,没理由不认
+    s = re.sub(r"[一二两三四五六七八九十]+",
+               lambda m: _cn_num(m.group(0)) or m.group(0), s)
+    s = s.replace("个半", ".5").replace("半", "0.5")
+
+    total, pos = 0.0, 0
+    while pos < len(s):
+        m = re.match(r"(\d+(?:\.\d+)?)([^\d.]*)", s[pos:])
+        if not m:
+            raise ValueError("看不懂这个时长")
+        num = float(m.group(1))
+        unit = m.group(2)
+        if not unit:
+            total += num                       # 光写个数字,当分钟
+        else:
+            for name, mins in _SPAN_UNITS:
+                if unit.startswith(name):
+                    total += num * mins
+                    break
+            else:
+                raise ValueError("不认识单位「%s」" % unit)
+        pos += m.end()
+
+    if total <= 0:
+        raise ValueError("时长得是个正数")
+    return timedelta(minutes=total)
 
 
 def due_label(due_iso, done):
@@ -1046,7 +1182,7 @@ class TodoBoard:
     def _win_hwnd(self, win):
         """窗口真正的顶层句柄。overrideredirect 的 Tk 窗外面还裹着一层系统
         框架,圆角和毛玻璃都得挂在那上面,挂错对象就静默无效。"""
-        return ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+        return top_hwnd(win)
 
     def _round_corners(self, win):
         """Win11 圆角;失败无副作用。"""
@@ -1059,11 +1195,12 @@ class TodoBoard:
             pass
 
     def _style_window(self, win):
-        """无边框窗的公共装束:圆角 + 重新映射时补挂毛玻璃。"""
+        """无边框窗的公共装束:不进任务栏 + 圆角 + 重新映射时补挂毛玻璃。"""
         win.overrideredirect(True)
         win.configure(bg=C_PANEL)
         win.attributes("-topmost", self.topmost)
         win.update_idletasks()
+        mark_tool_window(win)      # 无边框不等于不进任务栏,得另外说一声
         self._round_corners(win)
         # 必须判断 e.widget is win:子控件的 <Map> 也会走到挂在顶层窗上的这个
         # 绑定(顶层的路径在子控件的 bindtags 里),不筛的话建界面那一下会触发
@@ -1091,6 +1228,11 @@ class TodoBoard:
                 win.attributes("-alpha", self.opacity)
         except tk.TclError:
             pass
+        # 「不进任务栏」必须跟在这一句后面:上面那两行 -alpha 会把 Tk 原先挂的
+        # 工具窗标记抹掉(见 set_alpha 的说明),排在前面等于白设。顺带也管住了
+        # 重新 Map 的情况 —— 锁屏解锁、资源管理器重启之后外壳会重新认一遍窗口,
+        # 那时候也得有人在。已经对上的一遍是空操作,不花什么。
+        mark_tool_window(win)
 
     def _tint_of(self, col):
         return glass_tint(col["data"].get("color", C_ACCENT))
@@ -2674,7 +2816,7 @@ class TodoBoard:
         a = min(self.opacity, 0.15 + step * 0.12)
         for w in self._app_windows():
             try:
-                w.attributes("-alpha", a)
+                set_alpha(w, a)
             except tk.TclError:
                 continue
         if a < self.opacity:
@@ -3365,6 +3507,40 @@ class TaskEditor:
         tk.Label(body, text="可写:2026-10-09 18:00 / 10-09 / 明天 9:30 / 周日 / 18:00",
                  font=F.tiny, fg=C_TEXT_MUTE, bg=C_PANEL).pack(anchor="w", pady=(px(4), px(14)))
 
+        # 「从现在起多久」—— 同一个截止时间的另一种说法。想"一小时后"的人不该
+        # 被逼着先去算那是几点,所以两个框并排放着,填哪个都行。
+        span_head = tk.Frame(body, bg=C_PANEL)
+        span_head.pack(fill="x")
+        tk.Label(span_head, text="或者,从现在起", font=F.small, fg=C_TEXT_DIM,
+                 bg=C_PANEL).pack(side="left")
+        self.span_echo = tk.Label(span_head, text="", font=F.tiny,
+                                  fg=C_TEXT_MUTE, bg=C_PANEL)
+        self.span_echo.pack(side="left", padx=(px(8), 0))
+
+        span_row = tk.Frame(body, bg=C_PANEL)
+        span_row.pack(fill="x", pady=(px(4), px(6)))
+        self.span_var = tk.StringVar()
+        self._entry(span_row, self.span_var).pack(
+            fill="x", side="left", expand=True, ipady=px(5))
+        _dlg_btn(span_row, "清除",
+                 lambda: self.span_var.set("")).pack(side="left", padx=(px(6), 0))
+
+        span_quick = tk.Frame(body, bg=C_PANEL)
+        span_quick.pack(fill="x", pady=(0, px(4)))
+        for txt_ in ("30 分钟", "1 小时", "2 小时", "4 小时", "1 天"):
+            _small_btn(span_quick, txt_,
+                       lambda v=txt_: self.span_var.set(v)).pack(side="left", padx=(0, px(5)))
+
+        tk.Label(body, text="可写:1 小时 / 一小时 / 90 分钟 / 1.5 小时 / 2 天 / 半小时",
+                 font=F.tiny, fg=C_TEXT_MUTE, bg=C_PANEL).pack(anchor="w", pady=(px(4), px(14)))
+
+        # 两个框说的是同一件事,所以谁也不该跟谁打架:在一头落了字就把另一头
+        # 清干净,保存时只看眼前哪个框里有字。_syncing 是防回环的闸 —— 清另一
+        # 头会触发另一头的 trace,不加闸就是两个人互相清,谁也留不下。
+        self._syncing = False
+        self.due_var.trace_add("write", self._on_due_typed)
+        self.span_var.trace_add("write", self._on_span_typed)
+
         # 完成
         self.done_var = tk.BooleanVar(value=bool(task.get("done")))
         chk = tk.Checkbutton(body, text="已完成", variable=self.done_var,
@@ -3435,19 +3611,68 @@ class TaskEditor:
         d = m.group(1) if m else datetime.now().strftime("%Y-%m-%d")
         self.due_var.set(f"{d} {hhmm}")
 
+    def _on_due_typed(self, *_):
+        """写了绝对时间,就把「从现在起」那头清掉。"""
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            if self.due_var.get().strip():
+                self.span_var.set("")
+                self.span_echo.configure(text="")
+        finally:
+            self._syncing = False
+
+    def _on_span_typed(self, *_):
+        """写了时长,就把绝对时间那头清掉,顺手把「那是几点」算给他看。
+
+        这一步不是装饰:时长和时刻是两套坐标,用户在这儿敲「90 分钟」的时候
+        心里想的是"今晚九点前",得让他在按下保存之前就看见对不对。
+        """
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            txt = self.span_var.get().strip()
+            if txt:
+                self.due_var.set("")
+            try:
+                span = parse_span_str(txt)
+            except ValueError:
+                self.span_echo.configure(
+                    text="看不懂这个时长" if txt else "", fg=C_OVERDUE)
+            else:
+                self.span_echo.configure(
+                    text=("→ %s" % fmt_due(datetime.now() + span)) if span else "",
+                    fg=C_TEXT_MUTE)
+        finally:
+            self._syncing = False
+
     # -- 动作 ------------------------------------------------------------
     def save(self):
         title = self.title_var.get().strip()
         if not title:
             title = "未命名"
-        due_txt = self.due_var.get().strip()
-        try:
-            due = parse_due_str(due_txt)
-        except ValueError as ex:
-            Confirm(self.win, "时间格式不对",
-                    f"没看懂「{due_txt}」。\n\n{ex}\n\n"
-                    "可以写成:\n2026-10-09 18:00\n10-09\n明天 9:30\n周日\n18:00")
-            return
+        span_txt = self.span_var.get().strip()
+        if span_txt:
+            # 填了时长就以时长为准 —— 两个框互斥,走到这儿说明另一个是空的
+            try:
+                due = datetime.now() + parse_span_str(span_txt)
+            except ValueError as ex:
+                Confirm(self.win, "时长没看懂",
+                        f"没看懂「{span_txt}」。\n\n{ex}\n\n"
+                        "可以写成:\n1 小时\n一小时\n90 分钟\n1.5 小时\n"
+                        "1 小时 30 分\n2 天\n半小时")
+                return
+        else:
+            due_txt = self.due_var.get().strip()
+            try:
+                due = parse_due_str(due_txt)
+            except ValueError as ex:
+                Confirm(self.win, "时间格式不对",
+                        f"没看懂「{due_txt}」。\n\n{ex}\n\n"
+                        "可以写成:\n2026-10-09 18:00\n10-09\n明天 9:30\n周日\n18:00")
+                return
 
         t = self.task
         name = self.col_var.get()
@@ -3694,7 +3919,7 @@ class ReminderPopup:
         self.win = win
         win.overrideredirect(True)
         win.attributes("-topmost", True)
-        win.attributes("-alpha", 0.0)
+        set_alpha(win, 0.0)
         win.configure(bg=C_ACCENT)
 
         outer = tk.Frame(win, bg=C_ACCENT)
@@ -3736,6 +3961,7 @@ class ReminderPopup:
         _dlg_btn(row, "知道了", self.close).pack(side="right", padx=(0, px(6)))
 
         win.update_idletasks()
+        mark_tool_window(win)      # 一张浮出来的卡片,不该在任务栏上挂个按钮
         self.place(index)
         app.root.after(0, app.schedule_position)
 
@@ -3757,7 +3983,7 @@ class ReminderPopup:
             return
         a = min(0.96, 0.08 + step * 0.08)
         try:
-            self.win.attributes("-alpha", a)
+            set_alpha(self.win, a)
         except Exception:
             return
         if a < 0.96:
@@ -3804,7 +4030,7 @@ class Toast:
         self.done = False
         win.overrideredirect(True)
         win.attributes("-topmost", True)
-        win.attributes("-alpha", 0.0)
+        set_alpha(win, 0.0)
         box = tk.Frame(win, bg="#22222A", padx=px(18), pady=px(11))
         box.pack()
         tk.Label(box, text=msg, font=F.ui, fg=C_TEXT,
@@ -3817,6 +4043,7 @@ class Toast:
             self.act.bind("<Leave>", lambda e: self.act.configure(fg=C_ACCENT))
             self.act.bind("<Button-1>", lambda e: self._fire())
         win.update_idletasks()
+        mark_tool_window(win)      # 一闪而过的提示条,更不该在任务栏上留影
         tw, th = win.winfo_reqwidth(), win.winfo_reqheight()
         win.geometry(f"+{x + max(0, (w - tw) // 2)}+{y + px(14)}")
         self.fade(0, True, err=False)
@@ -3848,14 +4075,13 @@ class Toast:
         hold = 5000 if self.on_action else 1600
         try:
             if up and step <= goals:
-                self.win.attributes("-alpha",
-                                    min(0.95, step / goals * 0.95 + 0.05))
+                set_alpha(self.win, min(0.95, step / goals * 0.95 + 0.05))
                 self.win.after(16, lambda: self.fade(step + 1, True, err))
             elif up:
                 self.win.after(hold, lambda: self.fade(goals, False, err))
             else:
                 a = max(0.0, step / goals * 0.95)
-                self.win.attributes("-alpha", a)
+                set_alpha(self.win, a)
                 if step <= 0:
                     self.close()
                 else:
