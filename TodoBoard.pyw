@@ -822,21 +822,21 @@ def default_data():
             {"id": new_id(), "column_id": c1, "title": "交周报",
              "content": "把本周进展整理成一页发给组里",
              "due": fmt_due(tomorrow), "remind_minutes": 60,
-             "done": False, "created": now.isoformat(timespec="minutes"),
+             "done": False, "created": now.isoformat(timespec="seconds"),
              "notified": False, "snooze_until": None},
             {"id": new_id(), "column_id": c1, "title": "预约牙医",
              "content": "", "due": None, "remind_minutes": -1,
-             "done": False, "created": now.isoformat(timespec="minutes"),
+             "done": False, "created": now.isoformat(timespec="seconds"),
              "notified": False, "snooze_until": None},
             {"id": new_id(), "column_id": c2, "title": "学英语",
              "content": "每天 30 分钟,别断",
              "due": None, "remind_minutes": -1,
-             "done": False, "created": now.isoformat(timespec="minutes"),
+             "done": False, "created": now.isoformat(timespec="seconds"),
              "notified": False, "snooze_until": None},
             {"id": new_id(), "column_id": c2, "title": "读完《人月神话》",
              "content": "一个月内啃完,做读书笔记",
              "due": fmt_due(later), "remind_minutes": 1440,
-             "done": False, "created": now.isoformat(timespec="minutes"),
+             "done": False, "created": now.isoformat(timespec="seconds"),
              "notified": False, "snooze_until": None},
         ],
     }
@@ -2493,7 +2493,7 @@ class TodoBoard:
         self._new_snap = self.hist.snapshot()
         t = {"id": new_id(), "column_id": cid, "title": "", "content": "",
              "due": None, "remind_minutes": self.store.settings["default_remind_minutes"],
-             "done": False, "created": datetime.now().isoformat(timespec="minutes"),
+             "done": False, "created": datetime.now().isoformat(timespec="seconds"),
              "notified": False, "snooze_until": None}
         self.store.tasks.append(t)
         self.store.save()
@@ -3654,16 +3654,19 @@ class TaskEditor:
         if not title:
             title = "未命名"
         span_txt = self.span_var.get().strip()
+        now = None
         if span_txt:
             # 填了时长就以时长为准 —— 两个框互斥,走到这儿说明另一个是空的
             try:
-                due = datetime.now() + parse_span_str(span_txt)
+                span = parse_span_str(span_txt)
             except ValueError as ex:
                 Confirm(self.win, "时长没看懂",
                         f"没看懂「{span_txt}」。\n\n{ex}\n\n"
                         "可以写成:\n1 小时\n一小时\n90 分钟\n1.5 小时\n"
                         "1 小时 30 分\n2 天\n半小时")
                 return
+            now = datetime.now()
+            due = now + span
         else:
             due_txt = self.due_var.get().strip()
             try:
@@ -3695,7 +3698,15 @@ class TaskEditor:
 
         t["title"] = title
         t["content"] = self.txt.get("1.0", "end").strip()
-        t["due"] = fmt_due(due) if due else None
+        # 落到秒,不是落到分钟。截止时间这个值不只是拿去显示的 —— 那个进度环
+        # 的分母是「建这条的时刻 → 截止」,写「5 分钟」的任务只有 300 秒长,
+        # 时间戳砍掉秒就等于白送它将近一分钟,环一建出来就先走掉一成多。
+        t["due"] = due.isoformat(timespec="seconds") if due else None
+        if span_txt:
+            # 说「从现在起 5 分钟」的时候,这个环的两头都得钉在同一刻。不能让它
+            # 从"编辑窗弹出来那一刻"起算 —— 人在窗里挑分栏、写内容花掉的两分钟,
+            # 会被算成这两分钟里任务已经跑掉了,明明是刚定的。
+            t["created"] = now.isoformat(timespec="seconds")
         t["done"] = bool(self.done_var.get())
         if col:
             t["column_id"] = col["id"]
