@@ -107,6 +107,10 @@ def _row_box_cx():
 #   3. 只有一个暖色强调色(琥珀,取自 illustro 的 colorBar=235,170,0),
 #      且只在「置顶指示」「逾期/临近」两处出现,别处一律中性。
 #   4. 文字靠字重/字号/明度分四级层次,不靠加框。
+#   5. 栏色只染「玻璃」,不染「内容」。每栏底子带一点自己的色相(见 glass_tint),
+#      但文字、发丝线、按钮永远中性黑白灰 —— 染色是背景的事。这样几栏摆在一起
+#      是"几块不同的玻璃",而不是"几张彩色卡片"。第 2 条说的"中性"管的是**前景**;
+#      底色是唯一允许带色相的地方。
 C_PANEL      = "#0B0B0E"   # 面板底 = 分栏底 = 行底(唯一表面)
 C_HEADER     = "#131317"   # 标题栏(渐变起点,比正文略亮一点,像被照亮)
 C_HEADER_2   = "#0E0E11"   # 标题栏(渐变终点,过渡到面板底)
@@ -237,6 +241,20 @@ def _mix(c1, c2, k):
     return "#%02X%02X%02X" % (round(r1 + (r2 - r1) * k),
                               round(g1 + (g2 - g1) * k),
                               round(b1 + (b2 - b1) * k))
+
+
+GLASS_DYE = 0.86           # 栏色混进玻璃底的比例(见 glass_tint)
+
+
+def glass_tint(color):
+    """一栏的"玻璃底色":把栏色压成深色的那一层。
+
+    整块玻璃都染上这一栏的颜色 —— 但不能直接拿栏色去铺,那是荧光板不是玻璃。
+    和面板底混到只留一成多的色相:一眼分得出"这栏偏暖、那栏偏冷",又抢不走
+    文字的注意力。想让它更浓或更淡,改 GLASS_DYE:小 = 更花哨,大 = 更含蓄
+    (1.0 就是原来的纯黑)。0.80 试过,暖色那几栏会发土、显脏。
+    """
+    return _mix(color, C_PANEL, GLASS_DYE)
 
 
 # --------------------------------------------------------------------------
@@ -1013,13 +1031,48 @@ class TodoBoard:
         """一扇窗挂上当前该有的透明方式。"""
         try:
             if self.acrylic:
-                set_backdrop(self._win_hwnd(win), ACCENT_ACRYLIC, C_PANEL, self.opacity)
+                set_backdrop(self._win_hwnd(win), ACCENT_ACRYLIC,
+                             self._tint_for(win), self.opacity)
                 win.attributes("-alpha", 1.0)
             else:
                 set_backdrop(self._win_hwnd(win), ACCENT_DISABLED)
                 win.attributes("-alpha", self.opacity)
         except tk.TclError:
             pass
+
+    def _tint_of(self, col):
+        return glass_tint(col["data"].get("color", C_ACCENT))
+
+    def _tint_for(self, win):
+        """这扇窗该用哪块底色。栏目窗用自己的栏色,工具条那些是中性黑。"""
+        for c in self.columns:
+            if c["win"] is win:
+                return c.get("_tint") or self._tint_of(c)
+        return C_PANEL
+
+    def _apply_col_tint(self, col):
+        """把这一栏整块玻璃刷成它自己的颜色。
+
+        两条路都得刷:挂上毛玻璃的机器,透出来的是 DWM 那层 tint;挂不上的
+        (旧系统、远程桌面、驱动不给面子),看到的就是 canvas 自己的背景色。
+        哪条路生效由机器决定,这边两边都摆好,用户不用知道自己是哪一种。
+        """
+        want = self._tint_of(col)
+        if col.get("_tint") == want:
+            return
+        col["_tint"] = want
+        for w in (col["win"], col["hdr"], col["canvas"],
+                  col["rz_l"], col["rz_r"], col["rz_b"]):
+            try:
+                w.configure(bg=want)
+            except tk.TclError:
+                pass
+        if self.acrylic:
+            try:
+                set_backdrop(self._win_hwnd(col["win"]), ACCENT_ACRYLIC,
+                             want, self.opacity)
+            except tk.TclError:
+                pass
 
     def _apply_backdrop(self):
         """决定这一整套窗到底是毛玻璃还是均匀半透明。
@@ -1113,18 +1166,21 @@ class TodoBoard:
 
     def _make_column(self, col):
         x, y, w, h = self._col_geom(col)
+        # 整块玻璃的底色 —— 建窗口时就带上,免得先黑一下再变色
+        tint = glass_tint(col.get("color", C_ACCENT))
         win = tk.Toplevel(self.root)
         self._style_window(win)
         win.geometry(f"{w}x{h}+{x}+{y}")
+        win.configure(bg=tint)
 
-        hdr = tk.Canvas(win, bg=C_PANEL, highlightthickness=0, bd=0)
-        cv = tk.Canvas(win, bg=C_PANEL, highlightthickness=0, bd=0,
+        hdr = tk.Canvas(win, bg=tint, highlightthickness=0, bd=0)
+        cv = tk.Canvas(win, bg=tint, highlightthickness=0, bd=0,
                        yscrollincrement=px(24))
         entry = {"id": col["id"], "win": win, "hdr": hdr, "canvas": cv,
-                 "data": col,
-                 "rz_l": tk.Frame(win, bg=C_PANEL, cursor="sb_h_double_arrow"),
-                 "rz_r": tk.Frame(win, bg=C_PANEL, cursor="sb_h_double_arrow"),
-                 "rz_b": tk.Frame(win, bg=C_PANEL, cursor="sb_v_double_arrow")}
+                 "data": col, "_tint": tint,
+                 "rz_l": tk.Frame(win, bg=tint, cursor="sb_h_double_arrow"),
+                 "rz_r": tk.Frame(win, bg=tint, cursor="sb_h_double_arrow"),
+                 "rz_b": tk.Frame(win, bg=tint, cursor="sb_v_double_arrow")}
         self.columns.append(entry)
         self._layout_column(entry, w, h)
 
@@ -1351,6 +1407,7 @@ class TodoBoard:
         self._hov_tid = None
         self.add_geo.clear()
         for c in self.columns:
+            self._apply_col_tint(c)
             self.render_column(c)
         self._render_tool()
 
