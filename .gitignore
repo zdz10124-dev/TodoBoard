@@ -1,0 +1,15 @@
+# 本机数据 —— 里面记着真实的任务内容,不该进仓库
+data.json
+data.json.broken
+data.json.bak-*
+
+# 操作流水,同上
+activity.log
+activity.log.1
+
+# 改代码前留的手工备份
+*.bak-*
+
+# Python
+__pycache__/
+*.py[cod]
