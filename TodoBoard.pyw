@@ -15,6 +15,8 @@ TodoBoard —— 桌面半透明待办面板
 数据文件:与本脚本同目录的 data.json
 """
 
+import atexit
+import collections
 import copy
 import ctypes
 import json
@@ -611,6 +613,47 @@ def due_label(due_iso, done):
     return txt, C_TEXT_MUTE
 
 
+RING_URGENT_PCT = 0.05     # 剩余不到 5% 算"快结束了"
+RING_URGENT_SEC = 60       # 或者剩余不到 1 分钟
+RING_MIN_DEG = 12          # 弧再短也得画这么多,否则小进度等于没画
+SHAKE_MS = 90              # 快结束时环抖一拍要多久(毫秒)
+SHAKE_PX = 1.5             # 抖的幅度(逻辑像素)。再大就不是"轻轻"了
+
+
+def ring_progress(t, now=None):
+    """勾选圈里那圈进度该画成什么样。
+
+    返回 (已过比例, 颜色, 是不是快结束了);这条任务不该画环就返回 None。
+
+    比例量的是"从建这条任务起、到截止为止"这一段里已经过去的部分 —— 环从
+    十二点顺时针长过去,长满就是到点。用 created 当起点而不是固定的时间窗,
+    是因为它不用猜:任务活多久,这个环就走多久。
+    """
+    if t.get("done") or not t.get("due"):
+        return None
+    try:
+        due = datetime.fromisoformat(t["due"])
+        made = datetime.fromisoformat(t["created"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    total = (due - made).total_seconds()
+    if total <= 0:
+        return None
+    now = now or datetime.now()
+    left = (due - now).total_seconds()
+    if left <= 0:
+        # 逾期:环满着、红着,但**不抖**。抖是"快到点了"这一句话,说到点上
+        # 就该停;挂着一个逾期任务让它抖到天荒地老,那是噪音不是提醒。
+        return 1.0, C_OVERDUE, False
+    p = 1.0 - left / total
+    urgent = left <= RING_URGENT_SEC or (left / total) <= RING_URGENT_PCT
+    if urgent or left <= 3600:
+        color = C_SOON
+    else:
+        color = C_TEXT_MUTE
+    return p, color, urgent
+
+
 # --------------------------------------------------------------------------
 # 数据层
 # --------------------------------------------------------------------------
@@ -631,7 +674,7 @@ def default_data():
             # 几何 —— 每栏的位置和大小都存在自己的 columns 条目里了
             "x": None, "y": None, "height": 560,
             "opacity": 0.88, "topmost": True, "sound": True,
-            "hide_done": False, "default_remind_minutes": 60,
+            "hide_done": False, "default_remind_minutes": -1,
             "column_width": COL_W_DEF,
             "tool_x": None, "tool_y": None,
         },
@@ -646,12 +689,12 @@ def default_data():
              "done": False, "created": now.isoformat(timespec="minutes"),
              "notified": False, "snooze_until": None},
             {"id": new_id(), "column_id": c1, "title": "预约牙医",
-             "content": "", "due": None, "remind_minutes": 60,
+             "content": "", "due": None, "remind_minutes": -1,
              "done": False, "created": now.isoformat(timespec="minutes"),
              "notified": False, "snooze_until": None},
             {"id": new_id(), "column_id": c2, "title": "学英语",
              "content": "每天 30 分钟,别断",
-             "due": None, "remind_minutes": 60,
+             "due": None, "remind_minutes": -1,
              "done": False, "created": now.isoformat(timespec="minutes"),
              "notified": False, "snooze_until": None},
             {"id": new_id(), "column_id": c2, "title": "读完《人月神话》",
@@ -947,6 +990,10 @@ class TodoBoard:
         self.card_del = {}         # tid -> 行尾叉号那块"命中的底"的 item id
         self._hov_tid = None       # 鼠标正停在谁头上(给叉号的回退色用)
         self.card_check_geo = {}   # tid -> 勾选圈可点范围的 (x0,y0,x1,y1)
+        self.card_ring = {}        # tid -> (进度环 item id, 它该在的方框)
+        self._shake_tids = set()   # 快到点的那些任务,环在抖
+        self._shake_phase = 0      # 抖到第几拍了
+        self._shake_job = None     # 抖动的 after 句柄;没在抖就是 None
         self.card_del_geo = {}     # tid -> 行尾那个叉号可点范围的 (x0,y0,x1,y1)
         self.add_geo = {}          # 栏 id -> 「添加任务」那行的 (y0,y1)
         self._press_serial = None  # 上一次按下的序号,用来去重(见 _col_press)
@@ -963,6 +1010,8 @@ class TodoBoard:
         self.hist = Journal(self)  # 操作日志 + 撤回/重做,见 Journal
         self._new_snap = None      # 新建任务时先拍的底,标题填完再记账
         self._cur_toast = None     # 屏幕上正浮着的那条提示,换新的先把旧的收掉
+        self._hidden = False       # 面板被整个藏起来了(托盘菜单里切的那项)
+        self.tray = None           # 任务栏折叠区里那个图标,见 TrayIcon
 
         # 提醒卡片和提示条要有个"面板在哪儿"的参照,取第一栏(见 _sync_anchor)
         self.win_x = self.win_y = 0
@@ -976,6 +1025,9 @@ class TodoBoard:
         self.render_all()
         self.root.bind_all("<MouseWheel>", self._on_wheel)
         self.root.after(600, self._check_reminders)
+        self.tray = TrayIcon(self)
+        self.tray.start()
+        self.root.after(TRAY_POLL_MS, self._tray_pump)
 
         if os.environ.get("TODOBOARD_DEBUG"):
             print(f"[TodoBoard] dpi={DPI} scale={SCALE:.2f} "
@@ -1402,6 +1454,8 @@ class TodoBoard:
         self.card_hair.clear()
         self.card_check.clear()
         self.card_check_geo.clear()
+        self.card_ring.clear()
+        self._shake_tids.clear()
         self.card_del.clear()
         self.card_del_geo.clear()
         self._hov_tid = None
@@ -1410,6 +1464,93 @@ class TodoBoard:
             self._apply_col_tint(c)
             self.render_column(c)
         self._render_tool()
+        # 重画之后环的位置全变了,抖动的对象也重新数过一遍
+        self._shake_sync()
+
+    # -- 进度环:跟着时间走、快到了就抖 --------------------------------
+    def _shake_dx(self):
+        """这一拍环该偏多少。
+
+        0 → 右 → 0 → 左,四个相位一个来回。用正弦而不是随机数:随机看着像
+        卡顿,来回摆才像"在震"。相位一次只推一格,所以中途重画也还在同一个
+        节奏上,不会跳。
+        """
+        return px(SHAKE_PX) * math.sin(self._shake_phase * math.pi / 2)
+
+    def _ring_place(self, tid, dx):
+        """把一个环按"基准方框 + 偏移"摆好。
+
+        用 coords 绝对定位,不用 canvas.move —— move 是累加的,每拍再挪一次
+        dx,两秒钟这环就飞出栏外了。
+        """
+        got = self.card_ring.get(tid)
+        if not got:
+            return
+        item, cv, (x0, y0, x1, y1) = got
+        try:
+            cv.coords(item, x0 + dx, y0, x1 + dx, y1)
+        except tk.TclError:
+            pass
+
+    def _shake_tick(self):
+        """抖一拍,再约下一拍。"""
+        self._shake_job = None
+        if not self._shake_tids:
+            self._shake_phase = 0
+            return
+        self._shake_phase = (self._shake_phase + 1) % 4
+        dx = self._shake_dx()
+        for tid in list(self._shake_tids):
+            self._ring_place(tid, dx)
+        self._shake_job = self.root.after(SHAKE_MS, self._shake_tick)
+
+    def _shake_sync(self):
+        """该抖的让它抖着,没有了就停。
+
+        没有任务快结束时,面板连一个定时器都不留 —— 常驻桌面的东西,不该
+        在那儿空转。停下来时把环摆回正中,免得它歪着留在屏幕上。
+        """
+        if self._shake_tids:
+            if self._shake_job is None:
+                self._shake_job = self.root.after(SHAKE_MS, self._shake_tick)
+            return
+        if self._shake_job is not None:
+            try:
+                self.root.after_cancel(self._shake_job)
+            except tk.TclError:
+                pass
+            self._shake_job = None
+        if self._shake_phase:
+            self._shake_phase = 0
+            for tid in list(self.card_ring):
+                self._ring_place(tid, 0)
+
+    def _refresh_rings(self):
+        """时间往前走,环也得跟着长 —— 每半分钟跟提醒一起扫一遍。
+
+        不整栏重画:重画会把悬停和滚动都抖一下,而这里变的只是几个弧的角度。
+        顺手把"快结束了"的名单也更新了:刚够着线的开始抖,缓过来的停下。
+        """
+        urgent = set()
+        for tid, (item, cv, box) in list(self.card_ring.items()):
+            t = self.store.task(tid)
+            rp = ring_progress(t) if t else None
+            if not rp:
+                continue
+            p, color, is_urgent = rp
+            try:
+                cv.itemconfigure(item,
+                                 extent=-max(RING_MIN_DEG, 359.9 * p),
+                                 outline=color)
+            except tk.TclError:
+                continue
+            if is_urgent:
+                urgent.add(tid)
+        if urgent != self._shake_tids:
+            self._shake_tids = urgent
+            for tid in list(self.card_ring):
+                self._ring_place(tid, 0)
+            self._shake_sync()
 
     def visible_tasks(self, cid):
         out = []
@@ -1661,6 +1802,21 @@ class TodoBoard:
         cv.create_oval(cbx, cby, cbx + cb, cby + cb,
                        outline=C_RING, width=px(1.4), fill="",
                        tags=tags + ("check",))
+        # 有截止时间的,这一圈兼当进度环:从十二点顺时针长过去,长满就到点。
+        # 底下那圈灰的当轨道,弧叠在上面。快结束了会轻轻抖(见 _shake_tick)——
+        # 那是整块面板上唯一会动的东西,别处一律安静,不然就成迪厅了。
+        rp = ring_progress(t)
+        if rp:
+            p, rcolor, urgent = rp
+            arc = cv.create_arc(cbx, cby, cbx + cb, cby + cb,
+                                start=90,
+                                extent=-max(RING_MIN_DEG, 359.9 * p),
+                                style="arc", outline=rcolor, width=px(1.8),
+                                tags=tags + ("check",))
+            self.card_ring[tid] = (arc, cv, (cbx, cby, cbx + cb, cby + cb))
+            if urgent:
+                self._shake_tids.add(tid)
+                self._ring_place(tid, self._shake_dx())
         if done:
             # 完成态 = 暗圈 + 暗勾,不填色。做完的事不该比没做完的更亮,
             # 这一行的标题已经有删除线了,足够了。
@@ -2484,6 +2640,9 @@ class TodoBoard:
         if changed:
             self.store.save()
             self.render_all()
+        # 环要跟着时间长大。跟提醒共用这半分钟一次的节拍 —— 再开一个定时器
+        # 只是让这面板在你看不见的地方多转一圈,没这个必要。
+        self._refresh_rings()
         self.root.after(30000, self._check_reminders)
 
     def _show_reminder(self, t):
@@ -2521,12 +2680,341 @@ class TodoBoard:
         if a < self.opacity:
             self.root.after(16, lambda: self.fade_in(step + 1))
 
+    # -- 托盘那边递过来的活儿 ---------------------------------------------
+    def _tray_pump(self):
+        """替托盘的窗口过程收网,见 TrayIcon.pump。"""
+        if self.tray is not None:
+            self.tray.pump()
+        self.root.after(TRAY_POLL_MS, self._tray_pump)
+
+    # -- 从屏幕上整个收起来 ----------------------------------------------
+    def _set_visible(self, show):
+        """把所有的栏(和工具条)一起藏起来,或者一起放回来。
+
+        用 withdraw 而不是 iconify:这些窗全是 overrideredirect 的,iconify
+        之后任务栏上不会长出一个按钮来点,真就找不回来了。withdraw 只是不
+        显示 —— 位置、尺寸、滚到哪儿,什么都没动,deiconify 回来还是原样。
+        """
+        self._hidden = not show
+        for w in self._app_windows():
+            try:
+                w.deiconify() if show else w.withdraw()
+            except tk.TclError:
+                pass
+
+    def toggle_visible(self):
+        self._set_visible(self._hidden)
+
     # -- 退出 ------------------------------------------------------------
     def quit_app(self):
         self._save_geom()
         self._save_tool_geom()
         self.store.save()
+        if self.tray is not None:
+            self.tray.stop()
         self.root.destroy()
+
+
+# --------------------------------------------------------------------------
+# 任务栏托盘图标
+# --------------------------------------------------------------------------
+
+WM_TRAY = 0x8000 + 1            # 图标回调消息,自己定的(WM_APP + 1)
+WM_LBUTTONUP, WM_RBUTTONUP = 0x0202, 0x0205
+NIM_ADD, NIM_DELETE = 0, 2
+NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
+IMAGE_ICON = 1
+LR_LOADFROMFILE, LR_DEFAULTSIZE = 0x10, 0x40
+IDI_APPLICATION = 32512
+HWND_MESSAGE = -3               # "只收消息、不显示"的父窗口
+TRAY_ID = 1
+TRAY_POLL_MS = 150              # 主线程多久去收一次网(见 TrayIcon.pump)
+
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    """Shell_NotifyIconW 要的那个结构。
+
+    字段一个都不能少:cbSize 填的是整个结构的大小,系统拿它判断"你用的是
+    哪一版",少填一截就会被当成老版本,图标静悄悄加不上,还不报错。
+    """
+    _fields_ = [("cbSize", ctypes.c_uint32),
+                ("hWnd", ctypes.c_void_p),
+                ("uID", ctypes.c_uint32),
+                ("uFlags", ctypes.c_uint32),
+                ("uCallbackMessage", ctypes.c_uint32),
+                ("hIcon", ctypes.c_void_p),
+                ("szTip", ctypes.c_wchar * 128),
+                ("dwState", ctypes.c_uint32),
+                ("dwStateMask", ctypes.c_uint32),
+                ("szInfo", ctypes.c_wchar * 256),
+                ("uVersion", ctypes.c_uint32),
+                ("szInfoTitle", ctypes.c_wchar * 64),
+                ("dwInfoFlags", ctypes.c_uint32),
+                ("guidItem", ctypes.c_byte * 16),
+                ("hBalloonIcon", ctypes.c_void_p)]
+
+
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", ctypes.c_uint32),
+                ("lpfnWndProc", ctypes.c_void_p),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", ctypes.c_void_p),
+                ("hIcon", ctypes.c_void_p),
+                ("hCursor", ctypes.c_void_p),
+                ("hbrBackground", ctypes.c_void_p),
+                ("lpszMenuName", ctypes.c_wchar_p),
+                ("lpszClassName", ctypes.c_wchar_p)]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+# 窗口过程:LRESULT WINAPI WndProc(HWND, UINT, WPARAM, LPARAM)
+_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint32,
+                              ctypes.c_size_t, ctypes.c_ssize_t)
+
+_tray_seq = 0
+
+
+def _tray_class_name():
+    """窗口类名要唯一 —— 同一个进程里开第二个实例(测试就这么干)、或者程序
+    重载一次,同名类会让 RegisterClassW 直接失败,图标就没了。"""
+    global _tray_seq
+    _tray_seq += 1
+    return f"TodoBoardTray_{os.getpid()}_{_tray_seq}"
+
+
+class TrayIcon:
+    """任务栏右下角折叠区里那个小图标。
+
+    走的是 Windows 的老路子:自建一扇"只收消息、永远不显示"的窗,把它的
+    句柄交给 Shell_NotifyIcon,鼠标事件就从那扇窗的窗口过程进来。
+
+    为什么不用 pywin32 之类的库?这程序的态度是"双击就能跑、不装任何东西",
+    为了一个图标去拉一个第三方包不值。
+
+    为什么不用线程去泵消息?也没必要 —— 这扇窗和 Tk 开在同一个线程里,而
+    Tk 的 mainloop 本来就在泵这个线程的消息队列,消息自然会送到这儿来,
+    连 after 轮询都不用加。
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.hwnd = None
+        self._proc = None       # 必须留着引用,被 GC 掉 Windows 就会调到野指针上
+        self._cls = None
+        self._hicon = None
+        self._added = False
+        self._taskbar_created = 0
+        # 窗口过程只管往这儿丢记号,主线程来取 —— 为什么必须这么绕,见
+        # _on_message 的说明
+        self._events = collections.deque()
+
+    # -- 起 / 停 ----------------------------------------------------------
+    def start(self):
+        """把图标挂上去。成不成都不抛异常 —— 见 stop() 的说明。"""
+        # 进程以任何方式结束都要摘掉图标 —— 托盘图标是 explorer 替我们拿着
+        # 的,进程一死它不会自己消失,会变成任务栏上一个点不动的死图标,直
+        # 到鼠标从上面扫过去。正常退出走 quit_app,这条是兜底。
+        atexit.register(self.stop)
+        try:
+            self._create_window()
+            self._load_icon()
+            self._add()
+            return True
+        except Exception:
+            self.stop()
+            return False
+
+    def stop(self):
+        """把图标摘掉、把消息窗拆了。
+
+        全程吞异常:它只是个入口,挂不上或者摘不掉都不该影响面板本身。
+        退出前一定要摘 —— 留着的话任务栏上会挂一个点不动的死图标,直到
+        鼠标从它上面划过,那很吓人。
+        """
+        if self._added:
+            try:
+                nid = _NOTIFYICONDATAW()
+                nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+                nid.hWnd = self.hwnd
+                nid.uID = TRAY_ID
+                ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE,
+                                                        ctypes.byref(nid))
+            except Exception:
+                pass
+        self._added = False
+        if self.hwnd:
+            try:
+                ctypes.windll.user32.DestroyWindow(ctypes.c_void_p(self.hwnd))
+            except Exception:
+                pass
+        self.hwnd = None
+
+    # -- 内部 -------------------------------------------------------------
+    def _create_window(self):
+        user32 = ctypes.windll.user32
+        kern32 = ctypes.windll.kernel32
+        kern32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]   # 它在 kernel32,不在 user32
+        kern32.GetModuleHandleW.restype = ctypes.c_void_p
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
+        user32.RegisterClassW.restype = ctypes.c_uint16
+        user32.CreateWindowExW.argtypes = [
+            ctypes.c_uint32, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        user32.CreateWindowExW.restype = ctypes.c_void_p
+        user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                          ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+        user32.RegisterWindowMessageW.argtypes = [ctypes.c_wchar_p]
+        user32.RegisterWindowMessageW.restype = ctypes.c_uint32
+
+        hinst = kern32.GetModuleHandleW(None)
+        self._proc = _WNDPROC(self._on_message)
+        self._cls = _WNDCLASSW()
+        self._cls.lpfnWndProc = ctypes.cast(self._proc, ctypes.c_void_p)
+        self._cls.hInstance = hinst
+        self._cls.lpszClassName = _tray_class_name()
+        if not user32.RegisterClassW(ctypes.byref(self._cls)):
+            raise OSError("RegisterClassW 失败")
+        # 父窗口给 HWND_MESSAGE:这扇窗不进桌面、不进任务栏、Alt+Tab 里也
+        # 没有它,除了收消息什么都不干
+        self.hwnd = user32.CreateWindowExW(
+            0, self._cls.lpszClassName, "TodoBoard", 0, 0, 0, 0, 0,
+            ctypes.c_void_p(HWND_MESSAGE), None, hinst, None)
+        if not self.hwnd:
+            raise OSError("CreateWindowExW 失败")
+        self._taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+
+    def _load_icon(self):
+        """优先用同目录的 icon.ico,找不到就借系统的默认图标。
+
+        兜底不是多余的:用户完全可能把 .pyw 单独拷到别的目录去用。图标丑
+        一点,也好过托盘上一块空白。
+        """
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                      ctypes.c_uint32, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_uint32]
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.LoadIconW.restype = ctypes.c_void_p
+        ico = os.path.join(APP_DIR, "icon.ico")
+        if os.path.exists(ico):
+            self._hicon = user32.LoadImageW(None, ico, IMAGE_ICON, 0, 0,
+                                            LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        if not self._hicon:
+            self._hicon = user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
+
+    def _nid(self):
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = TRAY_ID
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uCallbackMessage = WM_TRAY
+        nid.hIcon = self._hicon
+        nid.szTip = "待办面板"
+        return nid
+
+    def _add(self):
+        fn = ctypes.windll.shell32.Shell_NotifyIconW
+        fn.argtypes = [ctypes.c_uint32, ctypes.POINTER(_NOTIFYICONDATAW)]
+        fn.restype = ctypes.c_int
+        nid = self._nid()
+        if not fn(NIM_ADD, ctypes.byref(nid)):
+            raise OSError("Shell_NotifyIcon 失败")
+        self._added = True
+
+    def _on_message(self, hwnd, msg, wp, lp):
+        """托盘的事件从这儿进来 —— Windows 直接调,而且是在 Tk 正忙着的时候
+        (它这会儿已经放开 GIL、蹲在消息循环里等消息)。
+
+        所以这里**一个 Tk 调用都不能有**,连 root.after 都不行:那等于在 Tcl
+        自己执行到一半的时候再挤进去调 Tcl,线程状态会被搅坏(实测:轻则
+        卡住,重则 interpreter 直接崩在 update 里)。这里只往队列里丢一个
+        记号就返回,活儿全交给主线程那边轮询的 pump() 去办。
+        """
+        try:
+            if msg == WM_TRAY:
+                if lp in (WM_LBUTTONUP, WM_RBUTTONUP):
+                    self._events.append("menu")
+            elif self._taskbar_created and msg == self._taskbar_created:
+                # explorer 重启过,托盘被清空了。不重加的话图标从此消失,
+                # 用户只能去任务管理器结束进程 —— 每个托盘程序都要挨这一下。
+                self._events.append("readd")
+        except Exception:
+            pass
+        return ctypes.windll.user32.DefWindowProcW(
+            ctypes.c_void_p(hwnd), msg, wp, lp)
+
+    def pump(self):
+        """主线程这边收网:把窗口过程记下的记号一件件办掉。
+
+        这不是"图省事的轮询" —— 消息只能从窗口过程进来,而那儿不能碰 Tk,
+        两边中间总得有一处搭这座桥。150ms 一次,队列空的时候就是一次判空
+        加一个 after,约等于不花钱。
+        """
+        while self._events:
+            what = self._events.popleft()
+            if what == "menu":
+                self._popup()
+            elif what == "readd":
+                self._added = False
+                try:
+                    self._add()
+                except Exception:
+                    pass
+
+    def _popup(self):
+        """在光标那儿弹出托盘菜单。
+
+        菜单挂 dlg_parent(那根能看见的工具条),不是挂 root:root 是
+        withdraw 的,拿一个不可见窗口当菜单的主人,弹出来的东西收不到点击。
+        Windows 上还有一个前台锁 —— 点托盘图标那一下,前台是任务栏(explorer
+        的),我们只是个蹲在后面的进程,"啪"地弹菜单会被拦下来,表现就是点了
+        没反应。先把自己的窗口抬成前台,菜单才有资格抢到鼠标。
+
+        tk_popup 会一直转到菜单被选掉或者点没了才返回。
+        """
+        m = tk.Menu(self.app.dlg_parent, tearoff=0, bg="#24243A", fg=C_TEXT,
+                    activebackground=C_ACCENT, activeforeground="#FFFFFF",
+                    bd=0, relief="flat")
+        m.add_command(label="显示待办面板" if self.app._hidden else "隐藏待办面板",
+                      command=self.app.toggle_visible)
+        m.add_command(label="展开全部栏" if self.app._collapsed else "收起全部栏",
+                      command=self.app.toggle_collapse)
+        m.add_separator()
+        m.add_command(label="设置…", command=self.app.open_settings)
+        m.add_command(label="退出", command=self.app.quit_app)
+        x, y = self._cursor_pos()
+        try:
+            user32 = ctypes.windll.user32
+            user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+            user32.SetForegroundWindow(
+                ctypes.c_void_p(self.app._win_hwnd(self.app.dlg_parent)))
+        except Exception:
+            pass
+        try:
+            m.tk_popup(x, y)
+        finally:
+            m.grab_release()
+
+    @staticmethod
+    def _cursor_pos():
+        """菜单弹在鼠标那儿 —— 图标在屏幕角落,菜单自然要贴着它,而不是贴着
+        面板(面板早被拖到别处去了)。
+
+        GetCursorPos 给的是物理像素,这程序启动时已经声明了 DPI 感知,和 Tk
+        的 x_root 是同一套坐标,可以直接用。
+        """
+        p = _POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
+        return p.x, p.y
 
 
 # --------------------------------------------------------------------------
@@ -2992,9 +3480,9 @@ class TaskEditor:
             v = SimplerPrompt(self.win, "自定义提醒",
                               "提前多少分钟提醒?(0 = 到点)", "30").result
             try:
-                t["remind_minutes"] = max(0, int(v)) if v else 60
+                t["remind_minutes"] = max(0, int(v)) if v else 0
             except (TypeError, ValueError):
-                t["remind_minutes"] = 60
+                t["remind_minutes"] = -1     # 输入没法解析就当没设提醒
         else:
             t["remind_minutes"] = next(v for n, v in REMIND_CHOICES if n == rlabel)
 
@@ -3075,7 +3563,7 @@ class SettingsDialog:
         # 默认提醒
         self._row(body, "新任务默认提前多久提醒")
         rlabel = next((n for n, v in REMIND_CHOICES
-                       if v == st.get("default_remind_minutes")), "提前 1 小时")
+                       if v == st.get("default_remind_minutes")), "不提醒")
         self.rm_var = tk.StringVar(value=rlabel)
         om = tk.OptionMenu(body, self.rm_var, *[n for n, _ in REMIND_CHOICES if n != "自定义…"])
         # indicatoron=False:关掉那个默认下拉箭头 —— 它在深色底上是一枚缺字符
@@ -3165,7 +3653,7 @@ class SettingsDialog:
 
     def _on_remind(self):
         label = self.rm_var.get()
-        v = next((v for n, v in REMIND_CHOICES if n == label), 60)
+        v = next((v for n, v in REMIND_CHOICES if n == label), -1)
         self.app.store.settings["default_remind_minutes"] = v
         self.app.store.save()
 
